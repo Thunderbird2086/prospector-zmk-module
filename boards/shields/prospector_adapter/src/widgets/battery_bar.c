@@ -99,7 +99,7 @@ static struct battery_state battery_bar_get_state(const zmk_event_t *eh) {
         };
     } else {
         const struct zmk_split_central_status_changed *conn_ev =
-            as_zmk_split_central_status_changed(eh);
+            as_zmk_battery_state_changed(eh);
         return (struct battery_state){
             .bat_info = false,
             .peripheral_connected = conn_ev->connected,

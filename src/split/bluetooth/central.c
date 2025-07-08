@@ -130,16 +130,50 @@ void release_peripheral_input_subs(struct bt_conn *conn) {
 #endif // IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
 static struct peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+// Slot recovery: check for stuck slots in CONNECTING state
+#define SLOT_CONNECTING_TIMEOUT_MS 5000
+static void slot_state_recovery_work_callback(struct k_work *work) {
+    static uint64_t last_checked[ZMK_SPLIT_BLE_PERIPHERAL_COUNT] = {0};
+    uint64_t now = k_uptime_get();
+    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+        if (peripherals[i].state == PERIPHERAL_SLOT_STATE_CONNECTING) {
+            if (last_checked[i] == 0) {
+                last_checked[i] = now;
+            } else if (now - last_checked[i] > SLOT_CONNECTING_TIMEOUT_MS) {
+                LOG_WRN("Peripheral slot %d stuck in CONNECTING for >%dms, resetting", i, SLOT_CONNECTING_TIMEOUT_MS);
+                release_peripheral_slot(i);
+                last_checked[i] = 0;
+            }
+        } else {
+            last_checked[i] = 0;
+        }
+    }
+}
+
+K_WORK_DEFINE(slot_state_recovery_work, slot_state_recovery_work_callback);
+
+// Periodically schedule slot recovery
+#define SLOT_RECOVERY_PERIOD_MS 1000
+static void slot_state_recovery_timer(struct k_timer *timer) {
+    k_work_submit(&slot_state_recovery_work);
+}
+
+K_TIMER_DEFINE(slot_state_recovery_timer_obj, slot_state_recovery_timer, NULL);
 
 static bool is_scanning = false;
 
 static const struct bt_uuid_128 split_service_uuid = BT_UUID_INIT_128(ZMK_SPLIT_BT_SERVICE_UUID);
 
+#define CENTRAL_POSITION_QUEUE_SIZE (CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE * 2)
 K_MSGQ_DEFINE(peripheral_event_msgq, sizeof(struct zmk_position_state_changed),
-              CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, 4);
+              CENTRAL_POSITION_QUEUE_SIZE, 4);
 
 void peripheral_event_work_callback(struct k_work *work) {
     struct zmk_position_state_changed ev;
+    int backlog = k_msgq_num_used_get(&peripheral_event_msgq);
+    if (backlog > CENTRAL_POSITION_QUEUE_SIZE / 2) {
+        LOG_WRN("peripheral_event_msgq backlog high: %d/%d", backlog, CENTRAL_POSITION_QUEUE_SIZE);
+    }
     while (k_msgq_get(&peripheral_event_msgq, &ev, K_NO_WAIT) == 0) {
         LOG_DBG("Trigger key position state change for %d", ev.position);
         raise_zmk_position_state_changed(ev);
@@ -252,11 +286,16 @@ int confirm_peripheral_slot_conn(struct bt_conn *conn) {
 }
 
 #if ZMK_KEYMAP_HAS_SENSORS
+#define CENTRAL_SENSOR_QUEUE_SIZE (CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE * 2)
 K_MSGQ_DEFINE(peripheral_sensor_event_msgq, sizeof(struct zmk_sensor_event),
-              CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, 4);
+              CENTRAL_SENSOR_QUEUE_SIZE, 4);
 
 void peripheral_sensor_event_work_callback(struct k_work *work) {
     struct zmk_sensor_event ev;
+    int backlog = k_msgq_num_used_get(&peripheral_sensor_event_msgq);
+    if (backlog > CENTRAL_SENSOR_QUEUE_SIZE / 2) {
+        LOG_WRN("peripheral_sensor_event_msgq backlog high: %d/%d", backlog, CENTRAL_SENSOR_QUEUE_SIZE);
+    }
     while (k_msgq_get(&peripheral_sensor_event_msgq, &ev, K_NO_WAIT) == 0) {
         LOG_DBG("Trigger sensor change for %d", ev.sensor_index);
         raise_zmk_sensor_event(ev);
@@ -290,7 +329,10 @@ static uint8_t split_central_sensor_notify_func(struct bt_conn *conn,
 
     memcpy(ev.channel_data, sensor_event.channel_data,
            sizeof(struct zmk_sensor_channel_data) * sensor_event.channel_data_size);
-    k_msgq_put(&peripheral_sensor_event_msgq, &ev, K_NO_WAIT);
+    int ret = k_msgq_put(&peripheral_sensor_event_msgq, &ev, K_NO_WAIT);
+    if (ret < 0) {
+        LOG_WRN("Dropped sensor event for sensor %d (queue full)", ev.sensor_index);
+    }
     k_work_submit(&peripheral_sensor_event_work);
 
     return BT_GATT_ITER_CONTINUE;
@@ -304,11 +346,16 @@ struct zmk_input_event_msg {
     struct zmk_split_input_event_payload payload;
 };
 
-K_MSGQ_DEFINE(peripheral_input_event_msgq, sizeof(struct zmk_input_event_msg), 5, 4);
+#define CENTRAL_INPUT_QUEUE_SIZE 10
+K_MSGQ_DEFINE(peripheral_input_event_msgq, sizeof(struct zmk_input_event_msg), CENTRAL_INPUT_QUEUE_SIZE, 4);
 //   CONFIG_ZMK_SPLIT_BLE_CENTRAL_INPUT_QUEUE_SIZE, 4);
 
 void peripheral_input_event_work_callback(struct k_work *work) {
     struct zmk_input_event_msg msg;
+    int backlog = k_msgq_num_used_get(&peripheral_input_event_msgq);
+    if (backlog > CENTRAL_INPUT_QUEUE_SIZE / 2) {
+        LOG_WRN("peripheral_input_event_msgq backlog high: %d/%d", backlog, CENTRAL_INPUT_QUEUE_SIZE);
+    }
     while (k_msgq_get(&peripheral_input_event_msgq, &msg, K_NO_WAIT) == 0) {
         int ret = zmk_input_split_report_peripheral_event(
             msg.reg, msg.payload.type, msg.payload.code, msg.payload.value, msg.payload.sync);
@@ -346,7 +393,10 @@ static uint8_t peripheral_input_event_notify_cb(struct bt_conn *conn,
     for (size_t i = 0; i < ARRAY_SIZE(peripheral_input_slots); i++) {
         if (&peripheral_input_slots[i].sub == params) {
             msg.reg = peripheral_input_slots[i].reg;
-            k_msgq_put(&peripheral_input_event_msgq, &msg, K_NO_WAIT);
+            int ret = k_msgq_put(&peripheral_input_event_msgq, &msg, K_NO_WAIT);
+            if (ret < 0) {
+                LOG_WRN("Dropped input event for reg %d (queue full)", msg.reg);
+            }
             k_work_submit(&input_event_work);
         }
     }
@@ -391,7 +441,10 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
                                                         .state = pressed,
                                                         .timestamp = k_uptime_get()};
 
-                k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
+                int ret = k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
+                if (ret < 0) {
+                    LOG_WRN("Dropped position event for position %d (queue full)", position);
+                }
                 k_work_submit(&peripheral_event_work);
             }
         }
@@ -417,11 +470,16 @@ int zmk_split_get_peripheral_battery_level(uint8_t source, uint8_t *level) {
     return 0;
 }
 
+#define CENTRAL_BATT_QUEUE_SIZE (CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_QUEUE_SIZE * 2)
 K_MSGQ_DEFINE(peripheral_batt_lvl_msgq, sizeof(struct zmk_peripheral_battery_state_changed),
-              CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_QUEUE_SIZE, 4);
+              CENTRAL_BATT_QUEUE_SIZE, 4);
 
 void peripheral_batt_lvl_change_callback(struct k_work *work) {
     struct zmk_peripheral_battery_state_changed ev;
+    int backlog = k_msgq_num_used_get(&peripheral_batt_lvl_msgq);
+    if (backlog > CENTRAL_BATT_QUEUE_SIZE / 2) {
+        LOG_WRN("peripheral_batt_lvl_msgq backlog high: %d/%d", backlog, CENTRAL_BATT_QUEUE_SIZE);
+    }
     while (k_msgq_get(&peripheral_batt_lvl_msgq, &ev, K_NO_WAIT) == 0) {
         LOG_DBG("Triggering peripheral battery level change %u", ev.state_of_charge);
         peripheral_battery_levels[ev.source] = ev.state_of_charge;
@@ -457,7 +515,10 @@ static uint8_t split_central_battery_level_notify_func(struct bt_conn *conn,
     LOG_DBG("Battery level: %u", battery_level);
     struct zmk_peripheral_battery_state_changed ev = {
         .source = peripheral_slot_index_for_conn(conn), .state_of_charge = battery_level};
-    k_msgq_put(&peripheral_batt_lvl_msgq, &ev, K_NO_WAIT);
+    int ret = k_msgq_put(&peripheral_batt_lvl_msgq, &ev, K_NO_WAIT);
+    if (ret < 0) {
+        LOG_WRN("Dropped battery event for source %d (queue full)", ev.source);
+    }
     k_work_submit(&peripheral_batt_lvl_work);
 
     return BT_GATT_ITER_CONTINUE;
@@ -496,7 +557,10 @@ static uint8_t split_central_battery_level_read_func(struct bt_conn *conn, uint8
 
     struct zmk_peripheral_battery_state_changed ev = {
         .source = peripheral_slot_index_for_conn(conn), .state_of_charge = battery_level};
-    k_msgq_put(&peripheral_batt_lvl_msgq, &ev, K_NO_WAIT);
+    int ret = k_msgq_put(&peripheral_batt_lvl_msgq, &ev, K_NO_WAIT);
+    if (ret < 0) {
+        LOG_WRN("Dropped battery event for source %d (queue full)", ev.source);
+    }
     k_work_submit(&peripheral_batt_lvl_work);
 
     return BT_GATT_ITER_CONTINUE;
@@ -789,9 +853,22 @@ static void split_central_process_connection(struct bt_conn *conn) {
         slot->discover_params.end_handle = 0xffff;
         slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
 
-        err = bt_gatt_discover(slot->conn, &slot->discover_params);
+        int max_retries = 3;
+        int retry_delay_ms = 200;
+        int attempt = 0;
+        while (attempt < max_retries) {
+            err = bt_gatt_discover(slot->conn, &slot->discover_params);
+            if (err == 0) {
+                LOG_DBG("GATT discovery attempt %d succeeded", attempt + 1);
+                break;
+            } else {
+                LOG_WRN("GATT discovery attempt %d failed (err %d)", attempt + 1, err);
+                k_msleep(retry_delay_ms);
+            }
+            attempt++;
+        }
         if (err) {
-            LOG_ERR("Discover failed(err %d)", err);
+            LOG_ERR("GATT discovery failed after %d attempts (err %d)", max_retries, err);
             return;
         }
     }
@@ -847,11 +924,26 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
     struct bt_le_conn_param *param =
         BT_LE_CONN_PARAM(CONFIG_ZMK_SPLIT_BLE_PREF_INT, CONFIG_ZMK_SPLIT_BLE_PREF_INT,
                          CONFIG_ZMK_SPLIT_BLE_PREF_LATENCY, CONFIG_ZMK_SPLIT_BLE_PREF_TIMEOUT);
-    err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &slot->conn);
+
+    int max_retries = 3;
+    int retry_delay_ms = 200;
+    int attempt = 0;
+    while (attempt < max_retries) {
+        err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &slot->conn);
+        if (err == 0) {
+            LOG_DBG("Connection attempt %d succeeded", attempt + 1);
+            break;
+        } else {
+            LOG_WRN("Connection attempt %d failed (err %d)", attempt + 1, err);
+            k_msleep(retry_delay_ms);
+        }
+        attempt++;
+    }
     if (err < 0) {
-        LOG_ERR("Create conn failed (err %d) (create conn? 0x%04x)", err, BT_HCI_OP_LE_CREATE_CONN);
+        LOG_ERR("Create conn failed after %d attempts (err %d) (create conn? 0x%04x)", max_retries, err, BT_HCI_OP_LE_CREATE_CONN);
         release_peripheral_slot(slot_idx);
         start_scanning();
+        return false;
     }
 
     return false;
@@ -1177,6 +1269,9 @@ static int zmk_split_bt_central_init(void) {
                        K_THREAD_STACK_SIZEOF(split_central_split_run_q_stack),
                        CONFIG_ZMK_BLE_THREAD_PRIORITY, NULL);
     bt_conn_cb_register(&conn_callbacks);
+
+    // Start slot state recovery timer
+    k_timer_start(&slot_state_recovery_timer_obj, K_MSEC(SLOT_RECOVERY_PERIOD_MS), K_MSEC(SLOT_RECOVERY_PERIOD_MS));
 
 #if IS_ENABLED(CONFIG_SETTINGS)
     settings_register(&ble_central_settings_handler);
