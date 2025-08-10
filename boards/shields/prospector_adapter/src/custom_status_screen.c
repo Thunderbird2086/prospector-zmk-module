@@ -6,6 +6,7 @@
 #include "widgets/layer_roller.h"
 #include "widgets/battery_bar.h"
 #include "widgets/caps_word_indicator.h"
+#include "widgets/output_status.h"
 
 #include <fonts.h>
 #include <sf_symbols.h>
@@ -18,6 +19,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 static struct zmk_widget_layer_roller layer_roller_widget;
 static struct zmk_widget_battery_bar battery_bar_widget;
 static struct zmk_widget_caps_word_indicator caps_word_indicator_widget;
+static struct zmk_widget_output_status output_status_widget;
 
 lv_obj_t *zmk_display_status_screen() {
     lv_obj_t *screen;
@@ -38,6 +40,10 @@ lv_obj_t *zmk_display_status_screen() {
     // lv_obj_set_width(zmk_widget_battery_bar_obj(&battery_bar_widget), lv_pct(100));
     lv_obj_set_size(zmk_widget_battery_bar_obj(&battery_bar_widget), lv_pct(100), 48);
     lv_obj_align(zmk_widget_battery_bar_obj(&battery_bar_widget), LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    // Initialize output status widget
+    zmk_widget_output_status_init(&output_status_widget, screen);
+    lv_obj_align(zmk_widget_output_status_obj(&output_status_widget), LV_ALIGN_TOP_MID, 0, 10);
 
     return screen;
 }
